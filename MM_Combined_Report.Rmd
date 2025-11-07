@@ -1,0 +1,314 @@
+title: "Mountain Madness – Combined Funnel Report (Bookings + Web Traffic + Email)" output: html_document: toc: true toc_depth: 3 number_sections: true theme: readable date: "r Sys.Date()"knitr::opts_chunk$set(
+echo    = FALSE,   # <— hide code
+message = FALSE,
+warning = FALSE,
+fig.width = 10,
+fig.height = 6,
+dpi = 300
+)
+1. Data Loading and Cleaning# ---- directories ----
+
+core_dir <- "data_core"
+web_dir  <- "data_web"
+out_dir  <- "output"
+if (!dir.exists(out_dir)) dir.create(out_dir)
+
+# ---- helpers ----
+
+norm_path <- function(u) tolower(gsub("\?.*$", "", trimws(as.character(u))))
+flag_denali  <- function(p) grepl("denali", p, ignore.case=TRUE)
+flag_feeder  <- function(p) grepl("avy|avalanche|baker|glacier|rainier|mountaineering", p, ignore.case=TRUE)
+first_col <- function(df, choices) { for(c in choices) if (c %in% names(df)) return(c); return(names(df)[1]) }
+
+# ---- packages ----
+
+pkgs <- c("readxl","dplyr","stringr","lubridate","janitor","tidyr",
+"ggplot2","forcats","scales","kableExtra")
+to_install <- pkgs[!pkgs %in% rownames(installed.packages())]
+if (length(to_install)) install.packages(to_install, dependencies = TRUE)
+invisible(lapply(pkgs, library, character.only = TRUE))
+options(stringsAsFactors = FALSE)
+
+# --- data_core loading (Confirmed working by user) ---
+
+trips_path    <- file.path(core_dir, "trips.xlsx")
+deposits_path <- file.path(core_dir, "deposits.xlsx")
+
+trips    <- readxl::read_excel(trips_path)    %>% janitor::clean_names()
+deposits <- readxl::read_excel(deposits_path) %>% janitor::clean_names()
+
+normalize_country <- function(c) {
+if (is.na(c)) return("Unknown")
+c <- stringr::str_trim(as.character(c))
+lc <- tolower(c)
+if (lc %in% c("united states","usa","u.s.a.","us","u.s")) return("USA")
+return(c)
+}
+
+dest_bucket <- function(x) {
+s <- tolower(x)
+if (str_detect(s,"denali")) {
+if (str_detect(s,"prep") || str_detect(s,"custom")) return("Denali Prep")
+else return("Denali Expedition")
+}
+if (str_detect(s,"avy|crevasse|course|glacier mountaineering|school")) return("Training/Course")
+if (str_detect(s,"rainier|baker|adams|shuksan|olympus|hood|forbidden|el dorado")) return("PNW Objectives")
+if (str_detect(s,"kili|kilimanjaro|aconcagua|everest|cho oyu|island peak|lobuche|ama dablam")) return("High-Altitude Expeditions")
+if (str_detect(s,"trek|wonderland|hike|backpacking")) return("Treks")
+return("Other")
+}
+
+trips <- trips %>%
+mutate(
+email_norm      = tolower(str_trim(email)),
+country         = vapply(country, normalize_country, FUN.VALUE = character(1)),
+tripdestination = str_trim(trip_destination),
+dest_bucket     = vapply(tripdestination, dest_bucket, FUN.VALUE = character(1)),
+is_denali       = dest_bucket %in% c("Denali Prep","Denali Expedition"),
+age_band        = cut(age,
+breaks = c(0,24,29,34,39,44,49,59,120),
+labels = c("<=24","25-29","30-34","35-39","40-44","45-49","50-59","60+"),
+include.lowest = TRUE),
+email_domain    = ifelse(str_detect(email_norm,"@"),
+sub(".*@(.*)$","\1", email_norm), NA_character_)
+)
+# Make generic column names, then parse what we need
+names(deposits) <- paste0("col_", seq_along(names(deposits)))
+
+deposits <- deposits %>%
+dplyr::filter(!is.na(col_2), !is.na(col_3)) %>%  # has first & last names
+mutate(
+timestamp = suppressWarnings(lubridate::ymd_hms(col_1, quiet = TRUE)),
+first     = str_trim(col_2),
+last      = str_trim(col_3),
+email     = tolower(str_trim(col_4)),
+source    = str_trim(col_6)
+) %>%
+dplyr::filter(str_detect(email,"@"))
+
+source_bucket <- function(s) {
+s_low <- tolower(ifelse(is.na(s),"",s))
+if (str_detect(s_low,"internet search|google|bing|seo"))                return("Organic Search")
+if (str_detect(s_low,"online advertising|advertising"))                 return("Paid Media")
+if (str_detect(s_low,"social|instagram|facebook|youtube|tiktok"))       return("Social")
+if (str_detect(s_low,"club|association") & str_detect(s_low,"referral")) return("Club/Association Referral")
+if (str_detect(s_low,"shop|company") & str_detect(s_low,"referral"))     return("Shop/Company Referral")
+if (str_detect(s_low,"referral"))                                        return("Personal Referral")
+if (str_detect(s_low,"newsletter|email"))                                return("Owned Email")
+if (str_detect(s_low,"podcast|into thin air|edge of the map|book"))      return("PR/Content Hook")
+if (s_low == "" || s_low == "other" || s_low == "nan")                   return("Unspecified/Other")
+return("Unspecified/Other")
+}
+
+deposits <- deposits %>%
+mutate(source_bucket = vapply(source, source_bucket, FUN.VALUE = character(1)),
+month = format(timestamp, "%Y-%m"))
+
+joined <- deposits %>% left_join(trips, by = c("email" = "email_norm"))
+joined$is_denali <- ifelse(is.na(joined$is_denali), FALSE, joined$is_denali)
+
+# --- data_web loading (FIXED FILE/COLUMN NAMES) ---
+# Load Data from data_web folder (Updated File Names)
+landing           <- read.csv(file.path(web_dir, "landing_pages.csv"), check.names = FALSE)
+landing_organic   <- read.csv(file.path(web_dir, "Google_organic_search_traffic.csv"), check.names = FALSE)
+traffic_acq       <- read.csv(file.path(web_dir, "traffic_channels.csv"), check.names = FALSE)
+user_acq          <- read.csv(file.path(web_dir, "user_acquisition.csv"), check.names = FALSE)
+geo_country       <- read.csv(file.path(web_dir, "Demographic_details_Country.csv"), check.names = FALSE)
+tech_browser      <- read.csv(file.path(web_dir, "Tech_details_Browser.csv"), check.names = FALSE)
+gsc_queries       <- read.csv(file.path(web_dir, "Queries_Organic_Google_Search.csv"), check.names = FALSE)
+email_campaigns   <- read.csv(file.path(web_dir, "MM Email Campaigns.csv"), check.names = FALSE)
+email_links       <- read.csv(file.path(web_dir, "Click Through Links from Email Campaigns - Sheet1.csv"), check.names = FALSE)
+
+# Landing Page Columns
+lpcol  <- "Landing page"
+sessions_lp  <- "Sessions"
+olpcol <- "Landing page + query string"
+sessions_olp <- "Active users" 
+
+# Channel Acquisition Columns
+chan_sess  <- "Session primary channel group (Default Channel Group)"
+sess_col   <- "Sessions"
+chan_first <- first_col(user_acq,    c("First user primary channel group (Default Channel Group)","Default Channel Group"))
+users_col  <- first_col(user_acq,    c("New users","Users","users"))
+
+# GSC Queries Columns
+qcol   <- "Organic Google Search query"
+clicks <- "Organic Google Search clicks"
+
+# Email Columns
+camp_key_campaigns <- "Campaign Name"
+sends_col <- "Sends"
+camp_key_links     <- "Distribution"
+urlcol_links       <- "Link"
+clickcol_links     <- "Unique Clicks"
+
+g_users   <- "Active users"
+b_users   <- "Active users"
+2. Core Funnel Analysis and Conversiondest_counts      <- trips    %>% count(tripdestination, name = "bookings") %>% arrange(desc(bookings))
+source_counts    <- deposits %>% count(source,        name = "deposits") %>% arrange(desc(deposits))
+monthly_deposits <- deposits %>% count(month,         name = "deposits") %>% arrange(month)
+
+knitr::kable(head(dest_counts, 10), caption = "Top 10 Trip Destinations") %>% kableExtra::kable_styling()
+knitr::kable(head(source_counts, 15), caption = "Top Sources (Deposits)") %>% kableExtra::kable_styling()
+knitr::kable(monthly_deposits,        caption = "Monthly Deposits (2025)") %>% kableExtra::kable_styling()
+
+conv_by_source_dest <- joined %>%
+filter(!is.na(dest_bucket)) %>%
+count(source_bucket, dest_bucket, name = "count")
+
+conv_pivot <- conv_by_source_dest %>%
+tidyr::pivot_wider(names_from = dest_bucket, values_from = count, values_fill = 0)
+
+knitr::kable(conv_pivot, caption = "Conversion Matrix: Source × Destination Bucket") %>% kableExtra::kable_styling()
+
+heat_df <- conv_by_source_dest %>%
+mutate(dest_bucket = factor(dest_bucket,
+levels = c("Denali Expedition","Denali Prep","High-Altitude Expeditions",
+"PNW Objectives","Training/Course","Treks","Other")))
+
+ggplot(heat_df, aes(x = dest_bucket, y = source_bucket, fill = count)) +
+geom_tile(color = "white") +
+scale_fill_gradient(name = "Matches", low = "#f0f0f0", high = "#08306b") +
+labs(title = "Conversion Matrix: Source Bucket × Destination Bucket",
+x = "Destination Bucket", y = "Source Bucket")
+
+denali_sources <- joined %>% filter(is_denali) %>%
+count(source_bucket, name = "denali_matches") %>%
+arrange(desc(denali_matches))
+
+knitr::kable(denali_sources, caption = "Denali Matches by Source Bucket") %>% kableExtra::kable_styling()
+
+ageband_by_dest <- trips %>%
+filter(!is.na(age_band)) %>%
+count(dest_bucket, age_band, name = "n") %>%
+group_by(dest_bucket) %>%
+mutate(pct = n / sum(n)) %>%
+ungroup()
+
+knitr::kable(head(ageband_by_dest, 20), caption = "Age-band Share within Bucket (sample)") %>% kableExtra::kable_styling()
+
+ggplot(ageband_by_dest %>%
+mutate(dest_bucket = fct_relevel(dest_bucket,
+"Denali Expedition","Denali Prep","High-Altitude Expeditions",
+"PNW Objectives","Training/Course","Treks","Other")),
+aes(dest_bucket, pct, fill = age_band)) +
+geom_col(position = "fill") +
+scale_y_continuous(labels = scales::percent) +
+coord_flip() +
+labs(title = "Age-band Share within Destination Buckets",
+x = "Destination Bucket", y = "Share", fill = "Age Band")
+3. Denali Propensity Scoringprospects <- trips %>%
+transmute(email_norm, age, gender, country, dest_bucket, tripdestination) %>%
+mutate(score = 0L) %>%
+mutate(
+score = score + ifelse(dest_bucket == "Denali Prep", 5L, 0L),
+score = score + ifelse(dest_bucket == "High-Altitude Expeditions", 3L, 0L),
+score = score + ifelse(dest_bucket == "PNW Objectives", 2L, 0L),
+score = score + ifelse(dest_bucket == "Training/Course", 1L, 0L),
+score = score + ifelse(!is.na(age) & age >= 30 & age <= 49, 2L, 0L),
+score = score + ifelse(country %in% c("USA","Canada"), 1L, 0L)
+)
+
+prospect_scores <- prospects %>%
+group_by(email_norm) %>%
+summarise(
+age_max = suppressWarnings(max(age, na.rm = TRUE)),
+gender  = dplyr::first(gender),
+country = dplyr::first(country),
+buckets = paste(sort(unique(dest_bucket)), collapse = ", "),
+score   = max(score, na.rm = TRUE),
+.groups = "drop"
+) %>%
+arrange(desc(score))
+
+top_100_prospects <- prospect_scores %>% slice_head(n = 100)
+
+knitr::kable(head(top_100_prospects, 20), caption = "Top 100 Denali Propensity Prospects (first 20)") %>% kableExtra::kable_styling()
+
+ggplot(prospect_scores, aes(score)) +
+geom_histogram(binwidth = 1) +
+labs(title = "Denali Propensity Score Distribution",
+x = "Propensity Score", y = "Count")
+
+into_thin_air_n <- deposits %>%
+filter(str_detect(tolower(source), "into thin air")) %>%
+nrow()
+cat("Into Thin Air mentions in deposits:", into_thin_air_n, "\n")
+4. Web Traffic and Email Channel Analysis# Normalize paths and flags
+landing$page_path         <- norm_path(landing[[lpcol]])
+landing_organic$page_path <- norm_path(landing_organic[[olpcol]])
+landing$is_denali         <- flag_denali(landing$page_path)
+landing$is_feeder         <- flag_feeder(landing$page_path)
+landing_organic$is_denali <- flag_denali(landing_organic$page_path)
+
+# Calculate Denali share
+denali_share_all <- with(aggregate(landing[[sessions_lp]], list(landing$is_denali), sum, na.rm=TRUE),
+x[Group.1==TRUE] / sum(x))
+denali_share_org <- sum(landing_organic[landing_organic$is_denali, sessions_olp], na.rm=TRUE) /
+sum(landing_organic[[sessions_olp]], na.rm=TRUE)
+
+cat("Denali landing share (ALL channels):  ", round(100*denali_share_all,1),  "%\n")
+cat("Denali landing share (ORGANIC only): ", round(100*denali_share_org,1), "%\n")
+
+# Channel Mix
+mix_sess <- aggregate(traffic_acq[[sess_col]], list(channel=traffic_acq[[chan_sess]]), sum, na.rm=TRUE)
+mix_user <- aggregate(user_acq[[users_col]],   list(channel=user_acq[[chan_first]]),   sum, na.rm=TRUE)
+
+channels_compare <- merge(mix_sess, mix_user, by="channel", all=TRUE)
+names(channels_compare) <- c("channel","sessions","new_users")
+
+tot_sess <- sum(channels_compare$sessions,  na.rm=TRUE)
+tot_new  <- sum(channels_compare$new_users, na.rm=TRUE)
+
+channels_compare <- channels_compare %>%
+mutate(session_ratio   = sessions  / tot_sess,
+new_user_ratio  = new_users / tot_new,
+lift_new_vs_sessions = new_user_ratio - session_ratio) %>%
+arrange(desc(lift_new_vs_sessions))
+
+knitr::kable(channels_compare, digits=3, caption="Channels: new-user lift vs session share") %>%
+kableExtra::kable_styling()
+
+# GSC Query Analysis
+bucket_query <- function(q){
+ql <- tolower(q)
+if (grepl("denali", ql)) return("Denali")
+if (grepl("mountain madness|mountainmadness| mm ", ql)) return("Brand")
+if (grepl("baker|avy|avalanche|glacier|rainier|mountaineering", ql)) return("Feeder")
+"General"
+}
+
+gsc_queries$bucket <- vapply(gsc_queries[[qcol]], bucket_query, FUN.VALUE=character(1))
+gsc_summary <- aggregate(gsc_queries[[clicks]], list(bucket=gsc_queries$bucket), sum, na.rm=TRUE)
+names(gsc_summary)[2] <- "clicks"
+gsc_summary <- gsc_summary[order(-gsc_summary$clicks),]
+
+knitr::kable(gsc_summary, caption="GSC clicks by intent bucket") %>% kableExtra::kable_styling()
+
+# Email Analysis
+email_links$page_path <- norm_path(email_links[[urlcol_links]])
+email_links$is_denali <- flag_denali(email_links$page_path)
+
+denali_clicks <- aggregate(email_links[[clickcol_links]],
+list(campaign=email_links[[camp_key_links]], is_denali=email_links$is_denali),
+sum, na.rm=TRUE)
+denali_clicks <- subset(denali_clicks, is_denali==TRUE)[,c("campaign","x")]
+names(denali_clicks)[2] <- "denali_clicks"
+
+email_denali <- merge(
+email_campaigns[, c(camp_key_campaigns, sends_col, setdiff(names(email_campaigns), character(0)))],
+denali_clicks, by.x=camp_key_campaigns, by.y="campaign", all.x=TRUE
+) %>%
+mutate(denali_clicks = ifelse(is.na(denali_clicks), 0, denali_clicks),
+denali_click_rate = ifelse(get(sends_col)>0, denali_clicks / get(sends_col), NA_real_)) %>%
+arrange(desc(denali_click_rate))
+
+knitr::kable(head(email_denali, 10), caption="Top campaigns by Denali click rate") %>%
+kableExtra::kable_styling()
+
+# Geo/Tech Details
+geo_top     <- geo_country[order(-geo_country[[g_users]]), ][1:min(15, nrow(geo_country)), ]
+browser_top <- tech_browser[order(-tech_browser[[b_users]]),][1:min(10, nrow(tech_browser)),]
+
+knitr::kable(geo_top,     caption="Top countries by users/sessions") %>% kableExtra::kable_styling()
+knitr::kable(browser_top, caption="Top browsers (watch for outliers)") %>% kableExtra::kable_styling()
